@@ -155,6 +155,7 @@ best_model_path = os.path.join(WORKING_DIR, f'best_overall_model_{timestamp}.h5'
 best_final_score = -1.0
 fold_scores = []
 
+# --- 修正後的訓練流程 ---
 print("\n開始交叉驗證訓練...")
 gkf = GroupKFold(n_splits=5)
 for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=subjects)):
@@ -198,7 +199,6 @@ for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=s
     y_pred_one_hot = model.predict(X_val)
     y_pred_classes = np.argmax(y_pred_one_hot, axis=1)
     
-    # 傳入動態生成的 NON_TARGET_GESTURES 列表
     binary_f1, macro_f1, final_score = evaluate_metrics(
         y_val, y_pred_classes, label_encoder, non_target_gestures
     )
@@ -207,17 +207,24 @@ for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=s
     print(f"  二元 F1 (Binary F1): {binary_f1:.4f}")
     print(f"  宏觀 F1 (Macro F1): {macro_f1:.4f}")
     print(f"  最終得分 (Final Score): {final_score:.4f}")
-    fold_scores.append(final_score)
-    
-    if final_score > best_final_score:
-        print(f"  新最佳得分 {final_score:.4f}！正在儲存模型...")
-        best_final_score = final_score
-        model.save(best_model_path)
+
+    # 加入 NaN 檢查，確保只有有效分數才進行儲存
+    if not np.isnan(final_score):
+        fold_scores.append(final_score)
+        if final_score > best_final_score:
+            print(f"  新最佳得分 {final_score:.4f}！正在儲存模型...")
+            best_final_score = final_score
+            model.save(best_model_path)
+    else:
+        print("  警告：此折疊的最終得分為 NaN，不計入平均。")
     
     os.remove(temp_checkpoint_filepath)
 
 print("\n訓練流程完成。")
-print(f"所有折疊的最終得分: {np.round(fold_scores, 4)}")
-print(f"平均最終得分: {np.mean(fold_scores):.4f}")
+# 處理所有得分都是 NaN 的情況
+if len(fold_scores) > 0:
+    print(f"所有有效折疊的最終得分: {np.round(fold_scores, 4)}")
+    print(f"平均最終得分: {np.mean(fold_scores):.4f}")
+else:
+    print("沒有有效的折疊分數可供平均。")
 print(f"\n最佳模型已儲存至: {best_model_path}，最終得分為: {best_final_score:.4f}")
-
