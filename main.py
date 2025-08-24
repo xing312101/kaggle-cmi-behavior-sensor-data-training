@@ -6,13 +6,13 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout
+from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout, Conv1D, MaxPooling1D
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from sklearn.metrics import f1_score
 import datetime
 import os
 
-# 定義路徑常數
+# 定義資料路徑
 WORKING_DIR = '/kaggle/working'
 TRAIN_CSV_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/train.csv'
 TRAIN_DEMO_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv'
@@ -26,11 +26,14 @@ def load_and_preprocess_data(train_csv_path, demos_csv_path):
     demographics_df = pd.read_csv(demos_csv_path)
     train_df = pd.merge(train_df, demographics_df, on='subject', how='left')
 
+    # --- 新增的邏輯：動態定義非目標手勢 ---
     # 根據 'sequence_type' 欄位來區分目標與非目標手勢
+    # 取得所有非目標序列的 gesture 名稱
     non_target_gestures_df = train_df[train_df['sequence_type'] != 'Target']
     non_target_gestures = non_target_gestures_df['gesture'].unique().tolist()
     print(f"自動偵測到的非目標手勢類別有: {non_target_gestures}")
-    
+
+    # 確保所有數值型和類別型特徵都正確定義
     sensor_features = [
         'acc_x', 'acc_y', 'acc_z',
         'rot_w', 'rot_x', 'rot_y', 'rot_z',
@@ -99,12 +102,17 @@ def build_model(input_shape, num_classes):
     """
     print("正在建立模型架構...")
     model = Sequential([
-        Bidirectional(LSTM(128, return_sequences=True), input_shape=input_shape),
-        Dropout(0.3),
+        Conv1D(filters=64, kernel_size=3, activation='relu', input_shape=input_shape),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.2),
+        
+        Bidirectional(LSTM(128, return_sequences=True)),
+        Dropout(0.2),
         Bidirectional(LSTM(64, return_sequences=True)),
-        Dropout(0.3),
+        Dropout(0.2),
         Bidirectional(LSTM(32)),
-        Dropout(0.3),
+        Dropout(0.2),
+        
         Dense(num_classes, activation='softmax')
     ])
     model.compile(
@@ -136,7 +144,7 @@ def evaluate_metrics(y_true, y_pred, label_encoder, non_target_gestures):
     return binary_f1, macro_f1, final_score
 
 # --- 主要訓練流程 ---
-# 這裡接收 load_and_preprocess_data 傳回的非目標手勢列表
+# 移除了手動定義的 NON_TARGET_GESTURES 列表
 X, y_gesture, subjects, label_encoder, non_target_gestures = load_and_preprocess_data(TRAIN_CSV_PATH, TRAIN_DEMO_PATH)
 num_gesture_classes = len(label_encoder.classes_)
 print(f"總共 {num_gesture_classes} 個動作類別。")
@@ -190,7 +198,7 @@ for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=s
     y_pred_one_hot = model.predict(X_val)
     y_pred_classes = np.argmax(y_pred_one_hot, axis=1)
     
-    # 傳入動態生成的 non_target_gestures 列表
+    # 傳入動態生成的 NON_TARGET_GESTURES 列表
     binary_f1, macro_f1, final_score = evaluate_metrics(
         y_val, y_pred_classes, label_encoder, non_target_gestures
     )
@@ -212,3 +220,4 @@ print("\n訓練流程完成。")
 print(f"所有折疊的最終得分: {np.round(fold_scores, 4)}")
 print(f"平均最終得分: {np.mean(fold_scores):.4f}")
 print(f"\n最佳模型已儲存至: {best_model_path}，最終得分為: {best_final_score:.4f}")
+
