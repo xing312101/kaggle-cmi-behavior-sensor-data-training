@@ -11,6 +11,9 @@ from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from sklearn.metrics import f1_score
 import os
 
+# 新增這行，匯入計算權重的函式
+from sklearn.utils import class_weight
+
 # 定義資料路徑
 WORKING_DIR = '/kaggle/working'
 TRAIN_CSV_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/train.csv'
@@ -29,12 +32,15 @@ demographic_features = [
     'adult_child', 'age', 'sex', 'handedness', 'height_cm',
     'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
 ]
-numerical_features = sensor_features + tof_features + demographic_features
+# 新增手動特徵
+manual_features = ['acc_mag']
+
+numerical_features = sensor_features + tof_features + demographic_features + manual_features
 categorical_features = ['orientation', 'behavior', 'phase']
 
 def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     """
-    載入並預處理資料，可以處理訓練集或測試集。
+    載入並預處理資料，並加入手動特徵工程。
     """
     print(f"正在載入和處理資料: {csv_path}")
     df = pd.read_csv(csv_path)
@@ -48,8 +54,11 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
         non_target_gestures = non_target_gestures_df['gesture'].unique().tolist()
         print(f"非目標手勢類別: {non_target_gestures}")
         
-    # 建立一個副本，將 DataFrame 碎片化問題降到最低
     df = df.copy()
+
+    # 計算新的特徵：加速度總幅度
+    print("正在進行手動特徵工程...")
+    df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
 
     # 建立一個字典，用來一次性儲存所有新欄位
     new_cols = {}
@@ -68,7 +77,6 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     else:
         label_encoder = None
 
-    # 使用 pd.concat 一次性將所有新欄位加入 DataFrame
     if new_cols:
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -200,9 +208,18 @@ best_model_path = os.path.join(WORKING_DIR, 'best_overall_model.h5')
 best_final_score = -1.0
 fold_scores = []
 
+# 計算類別權重
+print("\n正在計算類別權重...")
+class_weights = class_weight.compute_class_weight(
+    'balanced',
+    classes=np.unique(y_gesture),
+    y=y_gesture
+)
+class_weights_dict = dict(enumerate(class_weights))
+print("計算出的類別權重：", class_weights_dict)
+
 # 開始交叉驗證訓練
 print("\n開始交叉驗證訓練...")
-# n_sp = num_gesture_classes 
 n_sp = 5 
 gkf = GroupKFold(n_splits=n_sp)
 for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=subjects)):
@@ -237,7 +254,8 @@ for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=s
         batch_size=256,
         validation_data=(X_val, y_val_one_hot), 
         verbose=1,
-        callbacks=[model_checkpoint_callback, early_stopping_callback]
+        callbacks=[model_checkpoint_callback, early_stopping_callback],
+        class_weight=class_weights_dict
     )
 
     model.load_weights(temp_checkpoint_filepath)
@@ -286,5 +304,3 @@ predict_and_generate_submission(
     max_seq_len=max_seq_len,
     scaler=scaler
 )
-
-
