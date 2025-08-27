@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
 # 引入必要的層，用於構建複雜模型
-from tensorflow.keras.layers import Conv1D, BatchNormalization, Activation, add, MaxPooling1D, Dropout, Bidirectional, LSTM, GRU, Dense, Concatenate, Lambda, Multiply
+from tensorflow.keras.layers import Conv1D, BatchNormalization, Activation, add, MaxPooling1D, Dropout, Bidirectional, LSTM, GRU, Dense, Concatenate, Lambda, Multiply, LayerNormalization
+from tensorflow.keras.layers import MultiHeadAttention
 
 LEARNING_RATE = 8e-4
 N_COMPONENTS = 20
@@ -289,6 +290,19 @@ def residual_block(x, filters, kernel_size, drop=0.2):
     x = Dropout(drop)(x)
     return x
 
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    """Transformer 編碼器區塊"""
+    x = LayerNormalization(epsilon=1e-6)(inputs)
+    attn_output = MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
+    x = Dropout(dropout)(attn_output)
+    res1 = x + inputs
+    
+    x = LayerNormalization(epsilon=1e-6)(res1)
+    x = Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(x)
+    x = Dropout(dropout)(x)
+    x = Conv1D(filters=inputs.shape[-1], kernel_size=1)(x)
+    return x + res1
+
 # =========================================================================
 # 升級後的多輸入模型
 # =========================================================================
@@ -302,37 +316,27 @@ def build_multi_input_model(ts_input_shape, static_input_shape, num_classes):
     num_imu_features = len(sensor_features) + len(manual_features) + len(angular_velocity_features) + len([f'{col}_encoded' for col in categorical_features if f'{col}_encoded' in numerical_features_ts]) + 2
     
     # ------------------- IMU 分支 -------------------
-    # 使用 Lambda 層切分出 IMU 特徵
     imu_branch = Lambda(lambda t: t[:, :, :num_imu_features], name='imu_splitter')(ts_input)
-    
-    # 加入殘差區塊，強化 CNN 特徵提取能力
     imu_branch = residual_block(imu_branch, 64, 5, drop=0.3)
     imu_branch = residual_block(imu_branch, 128, 5, drop=0.3)
     
-    # 加入 Bi-LSTM
-    imu_branch = Bidirectional(LSTM(64, return_sequences=True))(imu_branch)
-    imu_branch = Bidirectional(LSTM(32, return_sequences=True))(imu_branch)
-    
-    # 加入注意力層，關注重要的時間步長
-    imu_branch = attention_layer(imu_branch)
+    # 加入 Transformer 編碼器
+    imu_branch = transformer_encoder(imu_branch, head_size=64, num_heads=4, ff_dim=128, dropout=0.3)
 
     # ------------------- TOF 分支 -------------------
-    # 使用 Lambda 層切分出 TOF 特徵 (PCA 降維後)
     tof_branch = Lambda(lambda t: t[:, :, num_imu_features:], name='tof_splitter')(ts_input)
-
-    # 較輕量的 TOF 處理分支
     tof_branch = Conv1D(64, 3, activation='relu', padding='same')(tof_branch)
     tof_branch = BatchNormalization()(tof_branch)
     tof_branch = MaxPooling1D(2)(tof_branch)
     tof_branch = Dropout(0.3)(tof_branch)
-
     tof_branch = Conv1D(128, 3, activation='relu', padding='same')(tof_branch)
     tof_branch = BatchNormalization()(tof_branch)
     tof_branch = MaxPooling1D(2)(tof_branch)
     tof_branch = Dropout(0.3)(tof_branch)
     
     # 加入注意力層
-    tof_branch = attention_layer(tof_branch)
+    imu_context = attention_layer(imu_branch)
+    tof_context = attention_layer(tof_branch)
     
     # ------------------- 靜態資料分支 -------------------
     static_input = layers.Input(shape=static_input_shape, name='static_input')
@@ -341,10 +345,8 @@ def build_multi_input_model(ts_input_shape, static_input_shape, num_classes):
     static_branch = layers.Dropout(0.4)(static_branch)
 
     # ------------------- 合併與輸出 -------------------
-    # 合併所有分支的輸出
-    merged = Concatenate()([imu_branch, tof_branch, static_branch])
+    merged = Concatenate()([imu_context, tof_context, static_branch])
     
-    # 共用全連接層
     merged = Dense(256, activation='relu')(merged)
     merged = BatchNormalization()(merged)
     merged = Dropout(0.5)(merged)
@@ -376,6 +378,26 @@ def evaluate_metrics(y_true, y_pred, label_encoder, non_target_gestures):
     
     final_score = (binary_f1 + macro_f1) / 2
     return binary_f1, macro_f1, final_score
+
+# =========================================================================
+# 新增的資料增強函式
+# =========================================================================
+def data_augmentation(data, augmentation_factor=0.1):
+    """
+    對時序資料進行資料增強。
+    目前包含時間抖動 (Jittering) 和時間縮放 (Scaling)。
+    """
+    aug_data = np.copy(data)
+    
+    # 時間抖動 (Jittering)：加入隨機雜訊
+    jitter = np.random.normal(0, augmentation_factor, size=aug_data.shape)
+    aug_data += jitter
+    
+    # 時間縮放 (Scaling)：乘以一個隨機縮放因子
+    scaling_factor = np.random.uniform(1 - augmentation_factor, 1 + augmentation_factor, size=(aug_data.shape[0], 1))
+    aug_data *= scaling_factor
+    
+    return aug_data
 
 def predict_and_generate_submission_ensemble(
     model_paths, test_sequences, test_static_data, test_sequence_ids, label_encoder, max_seq_len, ts_scaler, static_scaler, pca
@@ -413,7 +435,8 @@ def predict_and_generate_submission_ensemble(
                 'squeeze_last_axis': squeeze_last_axis, 
                 'expand_last_axis': expand_last_axis, 
                 'attention_layer': attention_layer, 
-                'residual_block': residual_block
+                'residual_block': residual_block,
+                'transformer_encoder': transformer_encoder,
             }
             model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
             
@@ -501,21 +524,25 @@ def train_and_predict_models():
         X_train_tof, X_val_tof = X_tof[train_index], X_tof[val_index]
         X_train_static, X_val_static = static_data[train_index], static_data[val_index]
         y_train, y_val = y_gesture[train_index], y_gesture[val_index]
-        
-        train_tof_flat = X_train_tof.reshape(-1, len(tof_features))
+
+        # 資料增強
+        X_train_ts_aug = data_augmentation(X_train_ts)
+        X_train_tof_aug = data_augmentation(X_train_tof)
+
+        train_tof_flat = X_train_tof_aug.reshape(-1, len(tof_features))
         val_tof_flat = X_val_tof.reshape(-1, len(tof_features))
         
         pca.fit(train_tof_flat)
-        X_train_tof_pca = pca.transform(train_tof_flat).reshape(X_train_tof.shape[0], X_train_tof.shape[1], N_COMPONENTS)
+        X_train_tof_pca = pca.transform(train_tof_flat).reshape(X_train_tof_aug.shape[0], X_train_tof_aug.shape[1], N_COMPONENTS)
         X_val_tof_pca = pca.transform(val_tof_flat).reshape(X_val_tof.shape[0], X_val_tof.shape[1], N_COMPONENTS)
         
-        ts_data_to_fit = X_train_ts.reshape(-1, X_train_ts.shape[2])
+        ts_data_to_fit = X_train_ts_aug.reshape(-1, X_train_ts_aug.shape[2])
         static_data_to_fit = X_train_static
         
         ts_scaler.fit(ts_data_to_fit)
         static_scaler.fit(static_data_to_fit)
         
-        X_train_ts_scaled = ts_scaler.transform(ts_data_to_fit).reshape(X_train_ts.shape)
+        X_train_ts_scaled = ts_scaler.transform(ts_data_to_fit).reshape(X_train_ts_aug.shape)
         X_val_ts_scaled = ts_scaler.transform(X_val_ts.reshape(-1, X_val_ts.shape[2])).reshape(X_val_ts.shape)
         
         X_train_static_scaled = static_scaler.transform(X_train_static)
