@@ -10,9 +10,19 @@ from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout, Input, 
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from sklearn.metrics import f1_score
 import os
-
-# 新增這行，匯入計算權重的函式
 from sklearn.utils import class_weight
+from tensorflow.keras import backend as K
+
+# =========================================================================
+# 設定隨機種子以確保可重現性
+# =========================================================================
+def set_seeds(seed=42):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    print(f"隨機種子已設定為 {seed}")
+
+set_seeds()
 
 # 定義資料路徑
 WORKING_DIR = '/kaggle/working'
@@ -32,7 +42,6 @@ demographic_features = [
     'adult_child', 'age', 'sex', 'handedness', 'height_cm',
     'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
 ]
-# 新增手動特徵
 manual_features = ['acc_mag']
 
 numerical_features = sensor_features + tof_features + demographic_features + manual_features
@@ -56,13 +65,10 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
         
     df = df.copy()
 
-    # 計算新的特徵：加速度總幅度
     print("正在進行手動特徵工程...")
     df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
 
-    # 建立一個字典，用來一次性儲存所有新欄位
     new_cols = {}
-    
     print("正在處理類別型特徵...")
     for col in categorical_features:
         if col in df.columns:
@@ -84,7 +90,7 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     df[numerical_features] = df[numerical_features].fillna(0)
     
     all_features = numerical_features + [f'{col}_encoded' for col in categorical_features]
-    
+
     print("正在將資料分組為序列...")
     grouped_sequences = df.groupby('sequence_id')
     sequences = []
@@ -184,6 +190,15 @@ def predict_and_generate_submission(
 # 載入和預處理訓練資料 (只需要做一次)
 train_sequences, y_gesture, subjects, _, label_encoder, non_target_gestures = load_and_preprocess_data(TRAIN_CSV_PATH, TRAIN_DEMO_PATH)
 
+# =========================================================================
+# 關鍵修改: 在這裡打亂序列的順序，而不是序列內的數據點
+# =========================================================================
+print("正在打亂動作序列的順序...")
+# 將所有相關列表打包
+combined = list(zip(train_sequences, y_gesture, subjects))
+np.random.shuffle(combined) # 打亂打包的列表
+train_sequences[:], y_gesture[:], subjects[:] = zip(*combined) # 解包回各自的列表
+
 # 計算並標準化，同時保存 scaler 和 max_seq_len
 sequence_lengths = [len(s) for s in train_sequences]
 max_seq_len = int(np.percentile(sequence_lengths, 99))
@@ -230,6 +245,9 @@ for fold, (train_index, val_index) in enumerate(gkf.split(X, y_gesture, groups=s
     
     y_train_one_hot = to_categorical(y_train, num_classes=num_gesture_classes)
     y_val_one_hot = to_categorical(y_val, num_classes=num_gesture_classes)
+
+    K.clear_session()
+    set_seeds()
 
     model = build_model(X_train.shape[1:], num_gesture_classes)
     
