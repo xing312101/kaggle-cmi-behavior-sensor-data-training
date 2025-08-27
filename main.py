@@ -15,7 +15,10 @@ from tensorflow.keras import backend as K
 from numpy.fft import rfft
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-from scipy.spatial.transform import Rotation as R # <-- 新增
+from scipy.spatial.transform import Rotation as R
+
+# 引入必要的層，用於構建複雜模型
+from tensorflow.keras.layers import Conv1D, BatchNormalization, Activation, add, MaxPooling1D, Dropout, Bidirectional, LSTM, GRU, Dense, Concatenate, Lambda, Multiply
 
 LEARNING_RATE = 8e-4
 N_COMPONENTS = 20
@@ -62,10 +65,7 @@ def remove_gravity_from_acc(df):
     """移除加速度數據中的重力影響，以獲得線性加速度。"""
     print("正在移除加速度數據中的重力...")
     
-    # 建立一個新的 DataFrame 來存放處理後的數據
     new_df = df[['sequence_id', 'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z']].copy()
-    
-    # 用 0 填充四元數缺失值，以避免轉換錯誤
     new_df[['rot_w', 'rot_x', 'rot_y', 'rot_z']] = new_df[['rot_w', 'rot_x', 'rot_y', 'rot_z']].fillna(0)
     
     processed_acc = []
@@ -77,7 +77,6 @@ def remove_gravity_from_acc(df):
         gravity_world = np.array([0, 0, 9.81])
 
         for i in range(len(group)):
-            # 檢查四元數是否有效
             if np.all(np.isclose(quat_values[i], 0)):
                 linear_accel[i, :] = acc_values[i, :]
                 continue
@@ -89,7 +88,6 @@ def remove_gravity_from_acc(df):
             except ValueError:
                 linear_accel[i, :] = acc_values[i, :]
         
-        # 建立處理後數據的 DataFrame 並添加到列表中
         processed_acc.append(pd.DataFrame(linear_accel, columns=['acc_x', 'acc_y', 'acc_z'], index=group.index))
 
     if processed_acc:
@@ -168,11 +166,9 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     
     print("正在進行手動特徵工程...")
 
-    # <-- 新增的物理特徵工程函式呼叫
     df = remove_gravity_from_acc(df)
     
     new_ts_features_df = pd.DataFrame({
-        # <-- 更新 acc_mag 的計算，使用處理後的加速度數據
         'acc_mag': np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2),
         'rot_x_rate': df.groupby('sequence_id')['rot_x'].diff().fillna(0),
         'rot_y_rate': df.groupby('sequence_id')['rot_y'].diff().fillna(0),
@@ -258,34 +254,106 @@ def build_ts_only_model(ts_input_shape, num_classes):
     model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE), loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
-def build_multi_input_model(ts_input_shape, static_input_shape, num_classes):
-    print("建立多輸入模型架構...")
-    ts_input = layers.Input(shape=ts_input_shape, name='ts_input')
-    x = layers.Conv1D(filters=64, kernel_size=5, activation='relu', padding='same')(ts_input)
-    x = layers.BatchNormalization()(x) 
-    x = layers.MaxPooling1D(pool_size=2)(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Bidirectional(layers.LSTM(32))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
+# --- 新增的自定義層次 ---
+def squeeze_last_axis(x):
+    return tf.squeeze(x, axis=-1)
 
+def expand_last_axis(x):
+    return tf.expand_dims(x, axis=-1)
+
+def attention_layer(inputs):
+    score = Dense(1, activation='tanh')(inputs)
+    score = Lambda(squeeze_last_axis)(score)
+    weights = Activation('softmax')(score)
+    weights = Lambda(expand_last_axis)(weights)
+    context = Multiply()([inputs, weights])
+    context = Lambda(lambda x: K.sum(x, axis=1))(context)
+    return context
+
+def residual_block(x, filters, kernel_size, drop=0.2):
+    """具有殘差連接的 CNN 區塊"""
+    shortcut = x
+    
+    for _ in range(2):
+        x = Conv1D(filters, kernel_size, padding='same', activation='relu')(x)
+        x = BatchNormalization()(x)
+    
+    # 調整捷徑的維度以匹配主路徑
+    if shortcut.shape[-1] != filters:
+        shortcut = Conv1D(filters, 1, padding='same')(shortcut)
+        shortcut = BatchNormalization()(shortcut)
+
+    x = add([x, shortcut])
+    x = Activation('relu')(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(drop)(x)
+    return x
+
+# =========================================================================
+# 升級後的多輸入模型
+# =========================================================================
+def build_multi_input_model(ts_input_shape, static_input_shape, num_classes):
+    print("建立升級版多輸入模型架構...")
+    
+    # ------------------- 主輸入層 -------------------
+    ts_input = layers.Input(shape=ts_input_shape, name='ts_input')
+    
+    # 確定 IMU 特徵的維度
+    num_imu_features = len(sensor_features) + len(manual_features) + len(angular_velocity_features) + len([f'{col}_encoded' for col in categorical_features if f'{col}_encoded' in numerical_features_ts]) + 2
+    
+    # ------------------- IMU 分支 -------------------
+    # 使用 Lambda 層切分出 IMU 特徵
+    imu_branch = Lambda(lambda t: t[:, :, :num_imu_features], name='imu_splitter')(ts_input)
+    
+    # 加入殘差區塊，強化 CNN 特徵提取能力
+    imu_branch = residual_block(imu_branch, 64, 5, drop=0.3)
+    imu_branch = residual_block(imu_branch, 128, 5, drop=0.3)
+    
+    # 加入 Bi-LSTM
+    imu_branch = Bidirectional(LSTM(64, return_sequences=True))(imu_branch)
+    imu_branch = Bidirectional(LSTM(32, return_sequences=True))(imu_branch)
+    
+    # 加入注意力層，關注重要的時間步長
+    imu_branch = attention_layer(imu_branch)
+
+    # ------------------- TOF 分支 -------------------
+    # 使用 Lambda 層切分出 TOF 特徵 (PCA 降維後)
+    tof_branch = Lambda(lambda t: t[:, :, num_imu_features:], name='tof_splitter')(ts_input)
+
+    # 較輕量的 TOF 處理分支
+    tof_branch = Conv1D(64, 3, activation='relu', padding='same')(tof_branch)
+    tof_branch = BatchNormalization()(tof_branch)
+    tof_branch = MaxPooling1D(2)(tof_branch)
+    tof_branch = Dropout(0.3)(tof_branch)
+
+    tof_branch = Conv1D(128, 3, activation='relu', padding='same')(tof_branch)
+    tof_branch = BatchNormalization()(tof_branch)
+    tof_branch = MaxPooling1D(2)(tof_branch)
+    tof_branch = Dropout(0.3)(tof_branch)
+    
+    # 加入注意力層
+    tof_branch = attention_layer(tof_branch)
+    
+    # ------------------- 靜態資料分支 -------------------
     static_input = layers.Input(shape=static_input_shape, name='static_input')
-    y = layers.Dense(128, activation='relu')(static_input)
-    y = layers.BatchNormalization()(y)
-    y = layers.Dropout(0.4)(y)
-    y = layers.Dense(64, activation='relu')(y)
-    y = layers.BatchNormalization()(y)
+    static_branch = layers.Dense(128, activation='relu')(static_input)
+    static_branch = layers.BatchNormalization()(static_branch)
+    static_branch = layers.Dropout(0.4)(static_branch)
+
+    # ------------------- 合併與輸出 -------------------
+    # 合併所有分支的輸出
+    merged = Concatenate()([imu_branch, tof_branch, static_branch])
     
-    combined = layers.concatenate([x, y])
-    
-    combined = layers.Dense(64, activation='relu')(combined)
-    combined = layers.BatchNormalization()(combined)
-    combined = layers.Dropout(0.4)(combined)
-    
-    output = layers.Dense(num_classes, activation='softmax')(combined)
+    # 共用全連接層
+    merged = Dense(256, activation='relu')(merged)
+    merged = BatchNormalization()(merged)
+    merged = Dropout(0.5)(merged)
+
+    merged = Dense(128, activation='relu')(merged)
+    merged = BatchNormalization()(merged)
+    merged = Dropout(0.3)(merged)
+
+    output = Dense(num_classes, activation='softmax')(merged)
     
     model = Model(inputs=[ts_input, static_input], outputs=output)
     model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE), loss='categorical_crossentropy', metrics=['accuracy'])
@@ -340,7 +408,14 @@ def predict_and_generate_submission_ensemble(
         model_name, model_path = model_info
         try:
             print(f"載入模型 {i+1}/{len(model_paths)} ({model_name}): {model_path}")
-            model = tf.keras.models.load_model(model_path)
+            # 載入模型時需要傳遞自定義物件
+            custom_objects = {
+                'squeeze_last_axis': squeeze_last_axis, 
+                'expand_last_axis': expand_last_axis, 
+                'attention_layer': attention_layer, 
+                'residual_block': residual_block
+            }
+            model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
             
             if model_name == 'ts_only':
                 predictions = model.predict(padded_test_sequences_final, verbose=0)
@@ -415,7 +490,6 @@ def train_and_predict_models():
     
     ensemble_model_paths = []
     
-    # 在迴圈外定義 PCA 和 Scaler
     pca = PCA(n_components=N_COMPONENTS)
     ts_scaler = StandardScaler()
     static_scaler = StandardScaler()
@@ -428,7 +502,6 @@ def train_and_predict_models():
         X_train_static, X_val_static = static_data[train_index], static_data[val_index]
         y_train, y_val = y_gesture[train_index], y_gesture[val_index]
         
-        # PCA 擬合與轉換 (在每個折疊內部進行)
         train_tof_flat = X_train_tof.reshape(-1, len(tof_features))
         val_tof_flat = X_val_tof.reshape(-1, len(tof_features))
         
@@ -436,7 +509,6 @@ def train_and_predict_models():
         X_train_tof_pca = pca.transform(train_tof_flat).reshape(X_train_tof.shape[0], X_train_tof.shape[1], N_COMPONENTS)
         X_val_tof_pca = pca.transform(val_tof_flat).reshape(X_val_tof.shape[0], X_val_tof.shape[1], N_COMPONENTS)
         
-        # StandardScaler 擬合與轉換
         ts_data_to_fit = X_train_ts.reshape(-1, X_train_ts.shape[2])
         static_data_to_fit = X_train_static
         
@@ -449,7 +521,6 @@ def train_and_predict_models():
         X_train_static_scaled = static_scaler.transform(X_train_static)
         X_val_static_scaled = static_scaler.transform(X_val_static)
         
-        # 合併降維後的 TOF 特徵到時序數據
         X_train_ts_final = np.concatenate([X_train_ts_scaled, X_train_tof_pca], axis=-1)
         X_val_ts_final = np.concatenate([X_val_ts_scaled, X_val_tof_pca], axis=-1)
         
