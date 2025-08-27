@@ -44,8 +44,11 @@ demographic_features = [
     'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
 ]
 manual_features = ['acc_mag']
+# 增加手動特徵：角速度的變化率
+angular_velocity_features = ['rot_x_rate', 'rot_y_rate', 'rot_z_rate']
 
-numerical_features = sensor_features + tof_features + demographic_features + manual_features
+
+numerical_features = sensor_features + tof_features + demographic_features + manual_features + angular_velocity_features
 categorical_features = ['orientation', 'behavior', 'phase']
 
 def generate_static_features(df, numerical_features):
@@ -85,6 +88,11 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     
     print("正在進行手動特徵工程...")
     df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+    
+    # 增加角速度的變化率特徵
+    df['rot_x_rate'] = df.groupby('sequence_id')['rot_x'].diff().fillna(0)
+    df['rot_y_rate'] = df.groupby('sequence_id')['rot_y'].diff().fillna(0)
+    df['rot_z_rate'] = df.groupby('sequence_id')['rot_z'].diff().fillna(0)
     
     print("正在處理類別型特徵...")
     for col in categorical_features:
