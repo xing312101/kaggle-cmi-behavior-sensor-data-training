@@ -21,11 +21,14 @@ from scipy.spatial.transform import Rotation as R
 from tensorflow.keras.layers import Conv1D, BatchNormalization, Activation, add, MaxPooling1D, Dropout, Bidirectional, LSTM, GRU, Dense, Concatenate, Lambda, Multiply, LayerNormalization
 from tensorflow.keras.layers import MultiHeadAttention, Conv2D, Reshape, MaxPooling2D, TimeDistributed
 
+# 停用 TensorFlow XLA，等待時間太久
+tf.config.optimizer.set_jit(False)
+
 # 調整學習率和正則化強度
 LEARNING_RATE = 2e-4
-L2_REG_STRENGTH = 0.005
-DROPOUT_RATE_CNN = 0.5
-DROPOUT_RATE_DENSE = 0.6
+L2_REG_STRENGTH = 0.01
+DROPOUT_RATE_CNN = 0.6
+DROPOUT_RATE_DENSE = 0.7
 EARLY_STOPPING_PATIENCE = 20
 
 # 全域變數用於模型集成，儲存每個模型的權重
@@ -73,12 +76,12 @@ NUM_TS_FEAT = len(numerical_features_ts) + len(categorical_features)
 def remove_gravity_from_acc(df):
     """移除加速度數據中的重力影響，以獲得線性加速度。"""
     print("正在移除加速度數據中的重力...")
-    
+
     new_df = df[['sequence_id', 'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z']].copy()
     new_df[['rot_w', 'rot_x', 'rot_y', 'rot_z']] = new_df[['rot_w', 'rot_x', 'rot_y', 'rot_z']].fillna(0)
-    
+
     processed_acc = []
-    
+
     for seq_id, group in new_df.groupby('sequence_id'):
         acc_values = group[['acc_x', 'acc_y', 'acc_z']].values
         quat_values = group[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
@@ -89,20 +92,20 @@ def remove_gravity_from_acc(df):
             if np.all(np.isclose(quat_values[i], 0)):
                 linear_accel[i, :] = acc_values[i, :]
                 continue
-            
+
             try:
                 rotation = R.from_quat(quat_values[i])
                 gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
                 linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
             except ValueError:
                 linear_accel[i, :] = acc_values[i, :]
-        
+
         processed_acc.append(pd.DataFrame(linear_accel, columns=['acc_x', 'acc_y', 'acc_z'], index=group.index))
 
     if processed_acc:
         processed_acc_df = pd.concat(processed_acc, axis=0)
         df.loc[processed_acc_df.index, ['acc_x', 'acc_y', 'acc_z']] = processed_acc_df.values
-        
+
     return df
 
 def generate_static_features(df):
@@ -111,15 +114,15 @@ def generate_static_features(df):
     此函數將計算時序數據的聚合統計量和頻域特徵。
     """
     print("正在計算靜態特徵...")
-    
+
     current_static_features = sensor_features + manual_features + ['tof_mean', 'tof_std']
-    
+
     agg_funcs = ['mean', 'std', 'min', 'max', 'median']
-    
+
     existing_ts_features = [feat for feat in current_static_features if feat in df.columns]
     stats_df = df.groupby('sequence_id')[existing_ts_features].agg(agg_funcs)
     stats_df.columns = [f'{col}_{stat}' for col, stat in stats_df.columns]
-    
+
     def get_fft_features_group(group):
         features = {}
         fft_subset_features = ['acc_x', 'acc_y', 'acc_z', 'acc_mag']
@@ -127,20 +130,20 @@ def generate_static_features(df):
             if col not in group.columns:
                 continue
             fft_result = rfft(group[col].values)
-            fft_amplitude = np.abs(fft_result)[:50] 
+            fft_amplitude = np.abs(fft_result)[:50]
             features.update({f'{col}_fft_{i}': val for i, val in enumerate(fft_amplitude)})
         return pd.Series(features)
-    
+
     existing_fft_features = list(set(['acc_x', 'acc_y', 'acc_z', 'acc_mag']) & set(df.columns))
     if existing_fft_features:
         fft_df = df.groupby('sequence_id')[existing_fft_features].apply(get_fft_features_group)
     else:
         fft_df = pd.DataFrame()
-    
+
     print("正在計算類別特徵的靜態統計...")
     cat_stats = pd.DataFrame()
     grouped_df = df.groupby('sequence_id')
-    
+
     for col in categorical_features:
         encoded_col = f'{col}_encoded'
         if encoded_col in df.columns:
@@ -148,9 +151,9 @@ def generate_static_features(df):
             cat_stats[f'{col}_changes'] = grouped_df[encoded_col].apply(lambda x: x.diff().ne(0).sum())
 
     print("正在計算 TOF 類別統計...")
-    
+
     existing_cat_features = [col for col in categorical_features if col in df.columns]
-    
+
     if existing_cat_features:
         grouped_by_cat = df.groupby(['sequence_id'] + existing_cat_features)
         tof_cat_mean_df = grouped_by_cat['tof_mean'].mean().unstack(level=existing_cat_features, fill_value=0)
@@ -160,7 +163,7 @@ def generate_static_features(df):
         tof_cat_mean_df = pd.DataFrame()
 
     static_features = pd.concat([stats_df, fft_df, cat_stats, tof_cat_mean_df], axis=1)
-    
+
     return static_features
 
 def load_and_preprocess_data(csv_path, demos_path, is_training=True, train_label_encoder=None, train_non_target_gestures=None):
@@ -168,15 +171,15 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True, train_label
     df = pd.read_csv(csv_path)
     demographics_df = pd.read_csv(demos_path)
     df = pd.merge(df, demographics_df, on='subject', how='left')
-    
+
     for col in sensor_features + tof_features + ['acc_mag', 'rot_x_rate', 'rot_y_rate', 'rot_z_rate']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
-    
+
     print("正在進行手動特徵工程...")
 
     df = remove_gravity_from_acc(df)
-    
+
     new_ts_features_df = pd.DataFrame({
         'acc_mag': np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2),
         'rot_x_rate': df.groupby('sequence_id')['rot_x'].diff().fillna(0),
@@ -193,7 +196,7 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True, train_label
             new_cat_features_df[f'{col}_encoded'] = df[col].astype('category').cat.codes
         else:
             new_cat_features_df[f'{col}_encoded'] = 0
-            
+
     if is_training:
         print("正在動態定義非目標手勢並進行標籤編碼...")
         non_target_gestures_df = df[df['sequence_type'] != 'Target']
@@ -212,12 +215,12 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True, train_label
     df[tof_features] = df[tof_features].fillna(-999)
     all_numerical_features = sensor_features + manual_features + ['tof_mean', 'tof_std'] + demographic_features
     df[all_numerical_features] = df[all_numerical_features].fillna(0)
-    
+
     static_features_df = generate_static_features(df)
-    
+
     df = df.set_index('sequence_id').join(static_features_df).reset_index()
     df[static_features_df.columns] = df[static_features_df.columns].fillna(0)
-    
+
     print("正在處理靜態特徵中的極端值...")
     for col in static_features_df.columns:
         if col in df.columns:
@@ -228,7 +231,7 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True, train_label
     print("正在將資料分組為序列...")
     time_series_features = numerical_features_ts + [f'{col}_encoded' for col in categorical_features if f'{col}_encoded' in df.columns]
     static_feature_names = list(static_features_df.columns)
-    
+
     sequences = []
     labels = []
     subjects = []
@@ -282,35 +285,35 @@ def expand_last_axis(x):
 def attention_layer(inputs):
     # 這裡的 Dense 層輸出 shape 是 (None, seq_len, 1)
     score = Dense(1, activation='tanh')(inputs)
-    
+
     # 修正: 明確指定 Lambda 層的輸出形狀
     # 移除最後一個維度 1，形狀變為 (None, seq_len)
     score = Lambda(lambda x: K.squeeze(x, axis=-1), output_shape=lambda s: (s[0], s[1]))(score)
-    
+
     # softmax 輸出形狀不變
     weights = Activation('softmax')(score)
-    
+
     # 修正: 明確指定 Lambda 層的輸出形狀
     # 增加一個維度 1，形狀變為 (None, seq_len, 1)
     weights = Lambda(lambda x: K.expand_dims(x, axis=-1), output_shape=lambda s: (s[0], s[1], 1))(weights)
-    
+
     # 按權重相乘，形狀不變
     context = Multiply()([inputs, weights])
-    
+
     # 修正: 明確指定 Lambda 層的輸出形狀
     # 沿著時間軸 (axis=1) 求和，形狀變為 (None, feature_dim)
     context = Lambda(lambda x: K.sum(x, axis=1), output_shape=lambda s: (s[0], s[2]))(context)
-    
+
     return context
 
 def residual_block(x, filters, kernel_size, drop=0.2):
     """具有殘差連接的 CNN 區塊"""
     shortcut = x
-    
+
     for _ in range(2):
         x = Conv1D(filters, kernel_size, padding='same', activation='relu')(x)
         x = BatchNormalization()(x)
-    
+
     # 調整捷徑的維度以匹配主路徑
     if shortcut.shape[-1] != filters:
         shortcut = Conv1D(filters, 1, padding='same')(shortcut)
@@ -328,7 +331,7 @@ def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
     attn_output = MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
     x = Dropout(dropout)(attn_output)
     res1 = x + inputs
-    
+
     x = LayerNormalization(epsilon=1e-6)(res1)
     x = Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(x)
     x = Dropout(dropout)(x)
@@ -341,22 +344,22 @@ def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
 def build_ts_only_model(input_shape, num_classes):
     print("建立單輸入模型架構...")
     ts_input = layers.Input(shape=input_shape, name='ts_only_input')
-    
-    x = residual_block(ts_input, 64, 5, drop=DROPOUT_RATE_CNN) 
-    x = residual_block(x, 128, 5, drop=DROPOUT_RATE_CNN) 
-    x = transformer_encoder(x, head_size=64, num_heads=4, ff_dim=128, dropout=DROPOUT_RATE_CNN) 
-    x = attention_layer(x)
 
-    x = Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(x)
-    x = BatchNormalization()(x)
-    x = Dropout(DROPOUT_RATE_DENSE)(x)
+    x = residual_block(ts_input, 64, 5, drop=DROPOUT_RATE_CNN)
+    x = residual_block(x, 128, 5, drop=DROPOUT_RATE_CNN)
+    x = transformer_encoder(x, head_size=32, num_heads=2, ff_dim=64, dropout=DROPOUT_RATE_CNN)
+    x = attention_layer(x)
 
     x = Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(x)
     x = BatchNormalization()(x)
     x = Dropout(DROPOUT_RATE_DENSE)(x)
 
+    x = Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(x)
+    x = BatchNormalization()(x)
+    x = Dropout(DROPOUT_RATE_DENSE)(x)
+
     output = Dense(num_classes, activation='softmax')(x)
-    
+
     model = Model(inputs=ts_input, outputs=output)
     model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE), loss='categorical_crossentropy', metrics=['accuracy'])
     return model
@@ -366,53 +369,53 @@ def build_ts_only_model(input_shape, num_classes):
 # =========================================================================
 def build_multi_input_model(ts_input_shape, static_input_shape, tof_input_shape, num_classes):
     print("建立升級版多輸入模型架構...")
-    
+
     # ------------------- 主輸入層 -------------------
     ts_input = layers.Input(shape=ts_input_shape, name='ts_input')
     tof_input = layers.Input(shape=tof_input_shape, name='tof_input')
     static_input = layers.Input(shape=static_input_shape, name='static_input')
 
     # ------------------- IMU 分支 -------------------
-    imu_branch = residual_block(ts_input, 64, 5, drop=DROPOUT_RATE_CNN) 
-    imu_branch = residual_block(imu_branch, 128, 5, drop=DROPOUT_RATE_CNN) 
-    imu_branch = transformer_encoder(imu_branch, head_size=64, num_heads=4, ff_dim=128, dropout=DROPOUT_RATE_CNN) 
+    imu_branch = residual_block(ts_input, 64, 5, drop=DROPOUT_RATE_CNN)
+    imu_branch = residual_block(imu_branch, 128, 5, drop=DROPOUT_RATE_CNN)
+    imu_branch = transformer_encoder(imu_branch, head_size=32, num_heads=2, ff_dim=64, dropout=DROPOUT_RATE_CNN)
     imu_context = attention_layer(imu_branch)
 
     # ------------------- TOF 分支 (使用 TimeDistributed 2D CNN) -------------------
     tof_reshaped = Reshape((tof_input_shape[0], 5, 64, 1))(tof_input)
-    
-    tof_branch = TimeDistributed(Conv2D(16, (3, 3), activation='relu', padding='same'))(tof_reshaped)
-    tof_branch = TimeDistributed(BatchNormalization())(tof_branch)
-    tof_branch = TimeDistributed(MaxPooling2D(pool_size=(2, 2)))(tof_branch) 
-    tof_branch = TimeDistributed(Dropout(DROPOUT_RATE_CNN))(tof_branch)
-    
-    tof_branch = TimeDistributed(Conv2D(32, (3, 3), activation='relu', padding='same'))(tof_branch)
+
+    tof_branch = TimeDistributed(Conv2D(8, (3, 3), activation='relu', padding='same'))(tof_reshaped) # 減少濾波器數量
     tof_branch = TimeDistributed(BatchNormalization())(tof_branch)
     tof_branch = TimeDistributed(MaxPooling2D(pool_size=(2, 2)))(tof_branch)
     tof_branch = TimeDistributed(Dropout(DROPOUT_RATE_CNN))(tof_branch)
-    
+
+    tof_branch = TimeDistributed(Conv2D(16, (3, 3), activation='relu', padding='same'))(tof_branch) # 減少濾波器數量
+    tof_branch = TimeDistributed(BatchNormalization())(tof_branch)
+    tof_branch = TimeDistributed(MaxPooling2D(pool_size=(2, 2)))(tof_branch)
+    tof_branch = TimeDistributed(Dropout(DROPOUT_RATE_CNN))(tof_branch)
+
     # 將 5D 輸出扁平化為 3D，以供 attention_layer 處理
     tof_branch = Reshape((-1, np.prod(tof_branch.shape[2:])))(tof_branch)
     tof_context = attention_layer(tof_branch)
-    
+
     # ------------------- 靜態資料分支 -------------------
-    static_branch = Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(static_input)
+    static_branch = Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(static_input)
     static_branch = BatchNormalization()(static_branch)
     static_branch = Dropout(DROPOUT_RATE_DENSE)(static_branch)
 
     # ------------------- 合併與輸出 -------------------
-    merged = Concatenate()([imu_context, tof_context, static_branch]) 
-    
-    merged = Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(merged)
-    merged = BatchNormalization()(merged)
-    merged = Dropout(DROPOUT_RATE_DENSE)(merged)
+    merged = Concatenate()([imu_context, tof_context, static_branch])
 
     merged = Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(merged)
     merged = BatchNormalization()(merged)
     merged = Dropout(DROPOUT_RATE_DENSE)(merged)
 
+    merged = Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(L2_REG_STRENGTH))(merged)
+    merged = BatchNormalization()(merged)
+    merged = Dropout(DROPOUT_RATE_DENSE)(merged)
+
     output = Dense(num_classes, activation='softmax')(merged)
-    
+
     model = Model(inputs=[ts_input, tof_input, static_input], outputs=output)
     model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE), loss='categorical_crossentropy', metrics=['accuracy'])
     return model
@@ -421,17 +424,17 @@ def evaluate_metrics(y_true, y_pred, label_encoder, non_target_gestures):
     """計算競賽所需的二元 F1 和宏觀 F1 分數。"""
     y_true_labels = label_encoder.inverse_transform(y_true)
     y_pred_labels = label_encoder.inverse_transform(y_pred)
-    
+
     is_target_true = np.isin(y_true_labels, non_target_gestures, invert=True).astype(int)
     is_target_pred = np.isin(y_pred_labels, non_target_gestures, invert=True).astype(int)
     binary_f1 = f1_score(is_target_true, is_target_pred, zero_division=0)
-    
+
     y_true_macro = np.where(np.isin(y_true_labels, non_target_gestures), 'non_target', y_true_labels)
     y_pred_macro = np.where(np.isin(y_pred_labels, non_target_gestures), 'non_target', y_pred_labels)
-    
+
     all_classes = np.unique(np.concatenate([y_true_macro, y_pred_macro]))
     macro_f1 = f1_score(y_true_macro, y_pred_macro, labels=all_classes, average='macro', zero_division=0)
-    
+
     final_score = (binary_f1 + macro_f1) / 2
     return binary_f1, macro_f1, final_score
 
@@ -442,48 +445,48 @@ def predict_and_generate_submission_ensemble(
     使用加權集成學習模型進行預測，並生成 submission.parquet 檔案。
     """
     print("\n--- 正在進行加權集成學習預測 ---")
-    
+
     padded_test_sequences = pad_sequences(test_sequences, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post')
     test_tof_padded = pad_sequences(test_tof_data, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post')
-    
+
     original_shape = padded_test_sequences.shape
     padded_test_sequences_scaled = ts_scaler.transform(
         padded_test_sequences.reshape(-1, original_shape[2])
     ).reshape(original_shape[0], original_shape[1], original_shape[2])
-    
+
     test_static_data_scaled = static_scaler.transform(test_static_data)
 
     ensemble_predictions = []
-    
+
     # 計算權重
     total_score = sum(model_scores.values())
     if total_score == 0:
         weights = {name: 1.0 / len(model_scores) for name in model_scores}
     else:
         weights = {name: score / total_score for name, score in model_scores.items()}
-    
+
     for i, model_info in enumerate(model_paths):
         model_name, model_path = model_info
         try:
             print(f"載入模型 {i+1}/{len(model_paths)} ({model_name}): {model_path}，權重: {weights.get(model_name, 0.0):.4f}")
             custom_objects = {
-                'squeeze_last_axis': squeeze_last_axis, 
-                'expand_last_axis': expand_last_axis, 
-                'attention_layer': attention_layer, 
+                'squeeze_last_axis': squeeze_last_axis,
+                'expand_last_axis': expand_last_axis,
+                'attention_layer': attention_layer,
                 'residual_block': residual_block,
                 'transformer_encoder': transformer_encoder,
             }
             model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
-            
+
             if 'ts_only' in model_name:
                 predictions = model.predict(padded_test_sequences_scaled, verbose=0)
             elif 'multi_input' in model_name:
                 predictions = model.predict({
-                    'ts_input': padded_test_sequences_scaled, 
+                    'ts_input': padded_test_sequences_scaled,
                     'tof_input': test_tof_padded,
                     'static_input': test_static_data_scaled
                 }, verbose=0)
-                
+
             ensemble_predictions.append(predictions * weights.get(model_name, 0.0))
             K.clear_session()
         except Exception as e:
@@ -499,15 +502,18 @@ def predict_and_generate_submission_ensemble(
     predicted_gestures = label_encoder.inverse_transform(predicted_classes)
 
     submission_df = pd.DataFrame({
-        'sequence_id': test_sequence_ids,
-        'gesture': predicted_gestures
+        'sequence_id': test_sequence_ids.astype('string'),
+        'gesture': predicted_gestures.astype('string')
     })
-    
+
     submission_file_path = os.path.join(WORKING_DIR, 'submission.parquet')
-    submission_df.to_parquet(submission_file_path, index=False)
-    
+
+    # 使用 engine='pyarrow' 並明確設定 index=False
+    submission_df.to_parquet(submission_file_path, engine='pyarrow', index=False)
+
     print(f"\n--- 提交檔案 '{submission_file_path}' 成功生成！ ---")
     print(submission_df.head())
+
 
 # =========================================================================
 # 主程式
@@ -527,14 +533,14 @@ def train_and_predict_models():
     padded_ts = pad_sequences(
         train_sequences, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post'
     )
-    
+
     padded_tof_data = pad_sequences(
         tof_data, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post'
     )
 
     num_gesture_classes = len(label_encoder.classes_)
     print(f"總共 {num_gesture_classes} 個動作類別。")
-    
+
     print("\n正在計算類別權重...")
     class_weights = class_weight.compute_class_weight(
         'balanced',
@@ -545,17 +551,17 @@ def train_and_predict_models():
     print("計算出的類別權重：", class_weights_dict)
 
     print("\n開始交叉驗證訓練...")
-    n_sp = 5 
+    n_sp = 5
     gkf = GroupKFold(n_splits=n_sp)
-    
+
     ensemble_model_paths = []
-    
+
     ts_scaler = StandardScaler()
     static_scaler = StandardScaler()
-    
+
     for fold, (train_index, val_index) in enumerate(gkf.split(padded_ts, y_gesture, groups=subjects)):
         print(f"\n- 折疊 (Fold) {fold+1}/{n_sp}")
-        
+
         X_train_ts, X_val_ts = padded_ts[train_index], padded_ts[val_index]
         X_train_tof, X_val_tof = padded_tof_data[train_index], padded_tof_data[val_index]
         X_train_static, X_val_static = static_data[train_index], static_data[val_index]
@@ -564,37 +570,37 @@ def train_and_predict_models():
         # 資料增強
         X_train_ts_aug = data_augmentation(X_train_ts)
         X_train_tof_aug = data_augmentation(X_train_tof)
-        
+
         ts_data_to_fit = X_train_ts_aug.reshape(-1, X_train_ts_aug.shape[2])
         static_data_to_fit = X_train_static
-        
+
         ts_scaler.fit(ts_data_to_fit)
         static_scaler.fit(static_data_to_fit)
-        
+
         X_train_ts_scaled = ts_scaler.transform(ts_data_to_fit).reshape(X_train_ts_aug.shape)
         X_val_ts_scaled = ts_scaler.transform(X_val_ts.reshape(-1, X_val_ts.shape[2])).reshape(X_val_ts.shape)
-        
+
         X_train_static_scaled = static_scaler.transform(X_train_static)
         X_val_static_scaled = static_scaler.transform(X_val_static)
-        
+
         y_train_one_hot = to_categorical(y_train, num_classes=num_gesture_classes)
         y_val_one_hot = to_categorical(y_val, num_classes=num_gesture_classes)
 
         for model_name_suffix in ['ts_only', 'multi_input']:
             K.clear_session()
             set_seeds()
-            
+
             model = None
             train_data, val_data = None, None
-            
+
             if model_name_suffix == 'ts_only':
                 model = build_ts_only_model(X_train_ts_scaled.shape[1:], num_gesture_classes)
                 train_data, val_data = X_train_ts_scaled, X_val_ts_scaled
             elif model_name_suffix == 'multi_input':
                 model = build_multi_input_model(
-                    X_train_ts_scaled.shape[1:], 
-                    X_train_static_scaled.shape[1:], 
-                    X_train_tof_aug.shape[1:], 
+                    X_train_ts_scaled.shape[1:],
+                    X_train_static_scaled.shape[1:],
+                    X_train_tof_aug.shape[1:],
                     num_gesture_classes
                 )
                 train_data = {'ts_input': X_train_ts_scaled, 'tof_input': X_train_tof_aug, 'static_input': X_train_static_scaled}
@@ -603,18 +609,18 @@ def train_and_predict_models():
             print(f"--- 訓練模型: {model_name_suffix} ---")
             temp_checkpoint_filepath = os.path.join(WORKING_DIR, f'best_model_fold_{fold+1}_{model_name_suffix}.h5')
             model_checkpoint_callback = ModelCheckpoint(
-                filepath=temp_checkpoint_filepath, 
-                monitor='val_loss', 
-                mode='min', 
-                save_best_only=True, 
+                filepath=temp_checkpoint_filepath,
+                monitor='val_loss',
+                mode='min',
+                save_best_only=True,
                 verbose=0
             )
             early_stopping_callback = EarlyStopping(
-                monitor='val_loss', 
+                monitor='val_loss',
                 patience=EARLY_STOPPING_PATIENCE,
                 restore_best_weights=True
             )
-            
+
             reduce_lr_callback = ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.3,
@@ -623,24 +629,47 @@ def train_and_predict_models():
             )
 
             history = model.fit(
-                train_data, 
-                y_train_one_hot, 
-                epochs=100, 
-                batch_size=64,
-                validation_data=(val_data, y_val_one_hot), 
+                train_data,
+                y_train_one_hot,
+                epochs=100,
+                batch_size=32, # 調整為 32
+                validation_data=(val_data, y_val_one_hot),
                 verbose=1,
                 callbacks=[model_checkpoint_callback, early_stopping_callback, reduce_lr_callback],
                 class_weight=class_weights_dict
             )
-            
+
+            # --- 在這裡重新加入繪圖程式碼 ---
+            history_df = pd.DataFrame(history.history)
+
+            plt.figure(figsize=(12, 6))
+            plt.plot(history_df['loss'], label='Training Loss')
+            plt.plot(history_df['val_loss'], label='Validation Loss')
+            plt.title(f'Model Loss for {model_name_suffix} (Fold {fold+1})')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+            plt.figure(figsize=(12, 6))
+            plt.plot(history_df['accuracy'], label='Training Accuracy')
+            plt.plot(history_df['val_accuracy'], label='Validation Accuracy')
+            plt.title(f'Model Accuracy for {model_name_suffix} (Fold {fold+1})')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
             model.load_weights(temp_checkpoint_filepath)
-            
+
             predictions = model.predict(val_data)
             predicted_classes = np.argmax(predictions, axis=1)
             binary_f1, macro_f1, final_score = evaluate_metrics(
                 y_val, predicted_classes, label_encoder, non_target_gestures
             )
-            
+
             print(f"模型 {model_name_suffix} 在折疊 {fold+1} 的驗證得分: Binary F1: {binary_f1:.4f}, Macro F1: {macro_f1:.4f}, Final Score: {final_score:.4f}")
 
             if not np.isnan(final_score):
