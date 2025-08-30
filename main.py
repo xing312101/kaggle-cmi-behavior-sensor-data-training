@@ -461,13 +461,6 @@ def train_and_predict_models():
     class_weights_dict = dict(enumerate(class_weights))
     print("計算出的類別權重：", class_weights_dict)
 
-    try:
-        strategy = tf.distribute.MirroredStrategy()
-        print(f"使用分散式策略，偵測到的裝置數量：{strategy.num_replicas_in_sync}")
-    except ValueError:
-        print("未偵測到多個 GPU，使用單一 GPU 或 CPU。")
-        strategy = tf.keras.distribute.get_strategy()
-
     print("\n開始交叉驗證訓練...")
     n_sp = 5
     gkf = GroupKFold(n_splits=n_sp)
@@ -483,8 +476,8 @@ def train_and_predict_models():
         y_val_one_hot = to_categorical(y_val, num_classes=num_gesture_classes)
         K.clear_session()
         set_seeds()
-        with strategy.scope():
-            model = build_two_branch_model(X_train_ts.shape[1:], X_train_static.shape[1:], num_gesture_classes, wd=WD)
+        
+        model = build_two_branch_model(X_train_ts.shape[1:], X_train_static.shape[1:], num_gesture_classes, wd=WD)
         temp_checkpoint_filepath = os.path.join(WORKING_DIR, f'best_model_fold_{fold+1}.h5')
         model_checkpoint_callback = ModelCheckpoint(
             filepath=temp_checkpoint_filepath, 
