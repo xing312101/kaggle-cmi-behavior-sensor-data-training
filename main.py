@@ -22,36 +22,29 @@ from tensorflow.keras.layers import (
     GlobalAveragePooling1D, Reshape, GaussianNoise, Input
 )
 from tensorflow.keras.mixed_precision import set_global_policy
+import joblib
+
+# Try to import Kaggle's CMI API
+try:
+    import cmi_api
+except ImportError:
+    print("cmi_api not found. Running in offline mode.")
+    cmi_api = None
 
 # 啟用混合精度訓練
 set_global_policy('mixed_float16')
 
+# =========================================================================
+# 全域參數
+# =========================================================================
 N_COMPONENTS = 20
 MIXUP_ALPHA = 0.4
 WD = 3e-3
 LR_INIT = 5e-4
-EPOCHS = 260
-PATIENCE = 60
+EPOCHS = 200
+PATIENCE = 30
 BATCH_SIZE = 64
 PAD_PERCENTILE = 95
-
-
-# =========================================================================
-# 設定隨機種子以確保可重現性
-# =========================================================================
-def set_seeds(seed=42):
-    """設定所有必要的隨機種子以確保實驗的可重現性。"""
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    tf.experimental.numpy.random.seed(seed)
-    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
-    print(f"隨機種子已設定為 {seed}")
-
-set_seeds()
-
-# 定義資料路徑
 WORKING_DIR = '/kaggle/working'
 TRAIN_CSV_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/train.csv'
 TRAIN_DEMO_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv'
@@ -72,17 +65,24 @@ demographic_features = [
 manual_features = ['acc_mag']
 angular_features = ['rot_x_rate', 'rot_y_rate', 'rot_z_rate', 'rot_dist']
 
-numerical_features_ts = sensor_features + manual_features + angular_features
-categorical_features = ['orientation', 'behavior', 'phase']
+# =========================================================================
+# 輔助函式與模型架構
+# =========================================================================
 
-# =========================================================================
-# 升級後的物理特徵工程函式
-# =========================================================================
+def set_seeds(seed=42):
+    """設定所有必要的隨機種子以確保實驗的可重現性。"""
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    tf.experimental.numpy.random.seed(seed)
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    print(f"隨機種子已設定為 {seed}")
+
+set_seeds()
 
 def remove_gravity_from_acc(df):
-    print("正在移除加速度數據中的重力...")
     df = df.copy()
-    # 修正 DeprecationWarning: 明確指定要處理的欄位
     gravity_removed_acc = df.groupby('sequence_id')[['acc_x', 'acc_y', 'acc_z', 'rot_x', 'rot_y', 'rot_z', 'rot_w']].apply(
         lambda x: _remove_gravity_from_acc_seq(x)
     ).droplevel(0)
@@ -105,15 +105,12 @@ def _remove_gravity_from_acc_seq(seq_df):
     return pd.DataFrame(linear_accel, columns=['acc_x', 'acc_y', 'acc_z'], index=seq_df.index)
 
 def calculate_angular_features(df, time_delta=1/200):
-    print("正在計算角速度和角距離...")
     df = df.copy()
     grouped = df.groupby('sequence_id')
-    # 修正 DeprecationWarning: 明確指定要處理的欄位
     angular_vel_df = grouped[['rot_x', 'rot_y', 'rot_z', 'rot_w']].apply(
         lambda x: _calculate_angular_velocity_seq(x, time_delta)
     )
     df[['rot_x_rate', 'rot_y_rate', 'rot_z_rate']] = angular_vel_df.droplevel(0)
-    # 修正 DeprecationWarning: 明確指定要處理的欄位
     angular_dist_df = grouped[['rot_x', 'rot_y', 'rot_z', 'rot_w']].apply(
         lambda x: _calculate_angular_distance_seq(x)
     )
@@ -148,7 +145,7 @@ def _calculate_angular_distance_seq(seq_df):
             pass
     return pd.Series(angular_dist, index=seq_df.index)
 
-def load_and_preprocess_data(csv_path, demos_path, is_training=True):
+def load_and_preprocess_data_for_training(csv_path, demos_path, is_training=True):
     print(f"正在載入和處理資料: {csv_path}")
     df = pd.read_csv(csv_path)
     demographics_df = pd.read_csv(demos_path)
@@ -157,7 +154,6 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     print("資料載入完成，正在進行特徵工程...")
     df[sensor_features] = df[sensor_features].ffill().bfill()
     
-    # 使用 assign 一次性創建新欄位，解決 PerformanceWarning
     df = df.assign(
         acc_mag=np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2).astype('float32')
     )
@@ -165,17 +161,15 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     df = remove_gravity_from_acc(df)
     df = calculate_angular_features(df)
     
-    print("正在使用中位數填充所有數值型特徵的缺失值...")
     numerical_cols = df.select_dtypes(include=np.number).columns
     median_values = df[numerical_cols].median()
     df[numerical_cols] = df[numerical_cols].fillna(median_values)
     
-    # 再次使用 assign 來創建 tof_mean 和 tof_std
     df = df.assign(
         tof_mean=df[tof_features].mean(axis=1),
         tof_std=df[tof_features].std(axis=1)
     )
-
+    
     sequences = []
     static_features = []
     labels = []
@@ -187,22 +181,15 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     
     if is_training:
         label_encoder = LabelEncoder()
-        # 使用 assign 創建 gesture_encoded
         df = df.assign(gesture_encoded=label_encoder.fit_transform(df['gesture']))
         non_target_gestures = df[df['sequence_type'] != 'Target']['gesture'].unique().tolist()
     else:
         label_encoder = None
         non_target_gestures = None
-
-    print("正在將資料分組為序列並提取特徵...")
     
-    # === 修正後的程式碼 ===
-    # 在分組之前一次性計算每個序列的 acc_mag_mean 和 acc_mag_std
-    # 這可以避免在迴圈內動態創建欄位
     grouped_stats = df.groupby('sequence_id')['acc_mag'].agg(['mean', 'std']).rename(columns={'mean': 'acc_mag_mean', 'std': 'acc_mag_std'})
     df = df.merge(grouped_stats, on='sequence_id', how='left')
     
-    # 更新時間序列特徵列表
     time_series_features = time_series_features + ['acc_mag_mean', 'acc_mag_std']
     
     for sequence_id, group in df.groupby('sequence_id'):
@@ -220,33 +207,9 @@ def load_and_preprocess_data(csv_path, demos_path, is_training=True):
     print("資料分組完成，準備回傳。")
     return sequences, np.array(labels) if is_training else None, np.array(subjects) if is_training else None, np.array(sequence_ids), label_encoder, non_target_gestures, np.array(static_features)
 
-# --- Mixup 數據增強生成器 ---
-class MixupGenerator(tf.keras.utils.Sequence):
-    def __init__(self, X, y, batch_size, alpha=0.2):
-        self.X, self.y = X, y
-        self.batch_size = batch_size
-        self.alpha = alpha
-        self.indices = np.arange(len(self.X))
-    def __len__(self):
-        return int(np.ceil(len(self.X) / self.batch_size))
-    def __getitem__(self, i):
-        idx = self.indices[i*self.batch_size:(i+1)*self.batch_size]
-        Xb, yb = self.X[idx], self.y[idx]
-        lam = np.random.beta(self.alpha, self.alpha)
-        perm = np.random.permutation(len(Xb))
-        X_mix = lam * Xb + (1 - lam) * Xb[perm]
-        y_mix = lam * yb + (1 - lam) * yb[perm]
-        return X_mix, y_mix
-    def on_epoch_end(self):
-        np.random.shuffle(self.indices)
-
-# --- 新增的自定義層次（從 Z 的程式碼優化）---
-def time_sum(x):
-    return K.sum(x, axis=1)
-def squeeze_last_axis(x):
-    return tf.squeeze(x, axis=-1)
-def expand_last_axis(x):
-    return tf.expand_dims(x, axis=-1)
+def time_sum(x): return K.sum(x, axis=1)
+def squeeze_last_axis(x): return tf.squeeze(x, axis=-1)
+def expand_last_axis(x): return tf.expand_dims(x, axis=-1)
 def se_block(x, reduction=8):
     ch = x.shape[-1]
     se = GlobalAveragePooling1D()(x)
@@ -255,52 +218,34 @@ def se_block(x, reduction=8):
     se = Reshape((1, ch))(se)
     return Multiply()([x, se])
 
-# 優化後的殘差區塊 (Residual Block)
 def residual_se_cnn_block(x, filters, kernel_size, pool_size=2, drop=0.3, wd=3e-3):
     shortcut = x
-    # 第一層卷積
-    x = Conv1D(filters, kernel_size, padding='same', use_bias=False,
-               kernel_regularizer=regularizers.l2(wd))(x)
+    x = Conv1D(filters, kernel_size, padding='same', use_bias=False, kernel_regularizer=regularizers.l2(wd))(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
-    # 第二層卷積
-    x = Conv1D(filters, kernel_size, padding='same', use_bias=False,
-               kernel_regularizer=regularizers.l2(wd))(x)
+    x = Conv1D(filters, kernel_size, padding='same', use_bias=False, kernel_regularizer=regularizers.l2(wd))(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
-    # 加入 SE 注意力機制
     x = se_block(x)
-    # 調整捷徑（shortcut）維度
     if shortcut.shape[-1] != filters:
-        shortcut = Conv1D(filters, 1, padding='same', use_bias=False,
-                          kernel_regularizer=regularizers.l2(wd))(shortcut)
+        shortcut = Conv1D(filters, 1, padding='same', use_bias=False, kernel_regularizer=regularizers.l2(wd))(shortcut)
         shortcut = BatchNormalization()(shortcut)
-    # 執行殘差連接
     x = add([x, shortcut])
     x = Activation('relu')(x)
     x = MaxPooling1D(pool_size)(x)
     x = Dropout(drop)(x)
     return x
 
-# 優化後的注意力層 (Attention Layer)
 def attention_layer(inputs):
-    # 計算分數
     score = Dense(1, activation='tanh')(inputs)
     score = Lambda(squeeze_last_axis)(score)
-    # 將分數轉換為權重
     weights = Activation('softmax')(score)
     weights = Lambda(expand_last_axis)(weights)
-    # 權重與輸入相乘
     context = Multiply()([inputs, weights])
-    # 對加權後的輸入求和
     context = Lambda(time_sum)(context)
     return context
 
-# =========================================================================
-# 優化後的多輸入模型 (雙分支設計)
-# =========================================================================
 def build_two_branch_model(ts_input_shape, static_input_shape, num_classes, wd=3e-3):
-    print("建立雙分支模型架構...")
     ts_input = Input(shape=ts_input_shape, name='ts_input')
     static_input = Input(shape=static_input_shape, name='static_input')
     imu_dim = len(sensor_features) + len(manual_features) + len(angular_features) + 2 + 2 
@@ -308,37 +253,27 @@ def build_two_branch_model(ts_input_shape, static_input_shape, num_classes, wd=3
     imu = Lambda(lambda t: t[:, :, :imu_dim])(ts_input)
     tof = Lambda(lambda t: t[:, :, imu_dim:])(ts_input)
     
-    # IMU 深層分支
     x1 = residual_se_cnn_block(imu, 64, 3, drop=0.1, wd=wd)
     x1 = residual_se_cnn_block(x1, 128, 5, drop=0.1, wd=wd)
-
-    # TOF 輕量分支
     x2 = Conv1D(64, 3, padding='same', use_bias=False, kernel_regularizer=regularizers.l2(wd))(tof)
     x2 = BatchNormalization()(x2); x2 = Activation('relu')(x2)
     x2 = MaxPooling1D(2)(x2); x2 = Dropout(0.2)(x2)
     x2 = Conv1D(128, 3, padding='same', use_bias=False, kernel_regularizer=regularizers.l2(wd))(x2)
     x2 = BatchNormalization()(x2); x2 = Activation('relu')(x2)
     x2 = MaxPooling1D(2)(x2); x2 = Dropout(0.2)(x2)
-    
-    # 融合時間序列分支
     merged_ts = Concatenate()([x1, x2])
-    
-    # 時序建模與注意力層
     xa = Bidirectional(LSTM(128, return_sequences=True, kernel_regularizer=regularizers.l2(wd)))(merged_ts)
     xb = Bidirectional(GRU(128, return_sequences=True, kernel_regularizer=regularizers.l2(wd)))(merged_ts)
     xc = GaussianNoise(0.09)(merged_ts)
     xc = Dense(16, activation='elu')(xc)
     x = Concatenate()([xa, xb, xc])
     x = Dropout(0.4)(x)
-    # 將時序特徵通過注意力層
     ts_context = attention_layer(x)
     
-    # 靜態數據分支
     static_branch = Dense(64, activation='relu', kernel_regularizer=regularizers.l2(wd))(static_input)
     static_branch = BatchNormalization()(static_branch)
     static_branch = Dropout(0.5)(static_branch)
     
-    # 最終融合與輸出
     merged_final = Concatenate()([ts_context, static_branch])
     merged_final = Dense(128, activation='relu', kernel_regularizer=regularizers.l2(wd))(merged_final)
     merged_final = BatchNormalization()(merged_final)
@@ -351,7 +286,6 @@ def build_two_branch_model(ts_input_shape, static_input_shape, num_classes, wd=3
     return model
 
 def evaluate_metrics(y_true, y_pred, label_encoder, non_target_gestures):
-    """計算競賽所需的二元 F1 和宏觀 F1 分數。"""
     y_true_labels = label_encoder.inverse_transform(y_true)
     y_pred_labels = label_encoder.inverse_transform(y_pred)
     is_target_true = np.isin(y_true_labels, non_target_gestures, invert=True).astype(int)
@@ -364,13 +298,7 @@ def evaluate_metrics(y_true, y_pred, label_encoder, non_target_gestures):
     final_score = (binary_f1 + macro_f1) / 2
     return binary_f1, macro_f1, final_score
 
-# =========================================================================
-# 繪製歷史圖表函式
-# =========================================================================
 def plot_training_history(histories):
-    """
-    Plots the training and validation loss and accuracy from multiple folds.
-    """
     print("\n--- 正在繪製訓練歷史圖表 ---")
     num_folds = len(histories)
     all_train_loss = [h.history['loss'] for h in histories]
@@ -391,55 +319,131 @@ def plot_training_history(histories):
     std_train_acc = np.nanstd(padded_train_acc, axis=0)
     std_val_acc = np.nanstd(padded_val_acc, axis=0)
     epochs_range = range(max_len)
-
     plt.figure(figsize=(12, 6))
-    plt.plot(epochs_range, avg_train_loss, label='平均訓練損失 (Average Training Loss)', color='blue')
+    plt.plot(epochs_range, avg_train_loss, label='平均訓練損失', color='blue')
     plt.fill_between(epochs_range, avg_train_loss - std_train_loss, avg_train_loss + std_train_loss, color='blue', alpha=0.1)
-    plt.plot(epochs_range, avg_val_loss, label='平均驗證損失 (Average Validation Loss)', color='red')
+    plt.plot(epochs_range, avg_val_loss, label='平均驗證損失', color='red')
     plt.fill_between(epochs_range, avg_val_loss - std_val_loss, avg_val_loss + std_val_loss, color='red', alpha=0.1)
-    plt.title('訓練與驗證損失 (Training and Validation Loss)')
-    plt.xlabel('輪數 (Epochs)')
-    plt.ylabel('損失 (Loss)')
+    plt.title('訓練與驗證損失')
+    plt.xlabel('輪數')
+    plt.ylabel('損失')
     plt.legend()
     plt.grid(True)
     plt.show()
-    
-
     plt.figure(figsize=(12, 6))
-    plt.plot(epochs_range, avg_train_acc, label='平均訓練準確率 (Average Training Accuracy)', color='blue')
+    plt.plot(epochs_range, avg_train_acc, label='平均訓練準確率', color='blue')
     plt.fill_between(epochs_range, avg_train_acc - std_train_acc, avg_train_acc + std_train_acc, color='blue', alpha=0.1)
-    plt.plot(epochs_range, avg_val_acc, label='平均驗證準確率 (Average Validation Accuracy)', color='red')
+    plt.plot(epochs_range, avg_val_acc, label='平均驗證準確率', color='red')
     plt.fill_between(epochs_range, avg_val_acc - std_val_acc, avg_val_acc + std_val_acc, color='red', alpha=0.1)
-    plt.title('訓練與驗證準確率 (Training and Validation Accuracy)')
-    plt.xlabel('輪數 (Epochs)')
-    plt.ylabel('準確率 (Accuracy)')
+    plt.title('訓練與驗證準確率')
+    plt.xlabel('輪數')
+    plt.ylabel('準確率')
     plt.legend()
     plt.grid(True)
     plt.show()
-    
 
 # =========================================================================
-# 主程式
+# 在線推斷所需的類別和函數
 # =========================================================================
-def train_and_predict_models():
-    # 載入並前處理訓練資料
-    train_sequences, y_gesture, subjects, _, label_encoder, non_target_gestures, static_data = load_and_preprocess_data(TRAIN_CSV_PATH, TRAIN_DEMO_PATH)
+
+class GesturePredictor:
+    def __init__(self, model_paths, max_seq_len, ts_scaler, static_scaler, pca, label_encoder):
+        self.models = []
+        for model_name, path in model_paths:
+            try:
+                model = tf.keras.models.load_model(
+                    path,
+                    custom_objects={
+                        'time_sum': time_sum, 'squeeze_last_axis': squeeze_last_axis, 'expand_last_axis': expand_last_axis,
+                        'se_block': se_block, 'residual_se_cnn_block': residual_se_cnn_block, 'attention_layer': attention_layer,
+                    },
+                    compile=False
+                )
+                self.models.append(model)
+            except Exception as e:
+                print(f"無法載入模型: {e}")
+        self.max_seq_len = max_seq_len
+        self.ts_scaler = ts_scaler
+        self.static_scaler = static_scaler
+        self.pca = pca
+        self.label_encoder = label_encoder
+
+    def preprocess(self, df):
+        # 進行與訓練時相同的特徵工程
+        df = df.copy()
+        df = df.assign(acc_mag=np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2).astype('float32'))
+        df = remove_gravity_from_acc(df)
+        df = calculate_angular_features(df)
+        numerical_cols = df.select_dtypes(include=np.number).columns
+        median_values = df[numerical_cols].median()
+        df[numerical_cols] = df[numerical_cols].fillna(median_values)
+        df = df.assign(tof_mean=df[tof_features].mean(axis=1), tof_std=df[tof_features].std(axis=1))
+        grouped_stats = df.groupby('sequence_id')['acc_mag'].agg(['mean', 'std']).rename(columns={'mean': 'acc_mag_mean', 'std': 'acc_mag_std'})
+        df = df.merge(grouped_stats, on='sequence_id', how='left')
+        
+        # 由於是單一序列，可以直接取第一行
+        static_data = df[demographic_features].iloc[0].values
+        
+        # 創建時間序列數據
+        time_series_features = sensor_features + manual_features + angular_features + ['acc_mag_mean', 'acc_mag_std', 'tof_mean', 'tof_std']
+        ts_data = df[time_series_features].values
+        tof_data = df[tof_features].values
+        combined_ts = np.concatenate([ts_data, tof_data], axis=1)
+
+        # 填充序列以符合模型輸入
+        ts_data_padded = pad_sequences([combined_ts], maxlen=self.max_seq_len, dtype='float32', padding='post', truncating='post')[0]
+
+        # 分割 IMU 和 TOF
+        imu_and_manual_features = len(sensor_features) + len(manual_features) + len(angular_features) + 2 + 2
+        imu_features = ts_data_padded[:, :imu_and_manual_features]
+        tof_features_data = ts_data_padded[:, imu_and_manual_features:]
+        
+        # PCA 變換 TOF 特徵
+        tof_features_pca = self.pca.transform(tof_features_data).reshape(self.max_seq_len, N_COMPONENTS)
+        
+        # 合併並標準化
+        final_ts_features = np.concatenate([imu_features, tof_features_pca], axis=-1)
+        final_ts_features_scaled = self.ts_scaler.transform(final_ts_features)
+        
+        # 標準化靜態特徵
+        static_data_scaled = self.static_scaler.transform(static_data.reshape(1, -1))
+
+        return final_ts_features_scaled.reshape(1, self.max_seq_len, -1), static_data_scaled
+
+    def predict(self, df):
+        ts_data, static_data = self.preprocess(df)
+        
+        ensemble_preds = []
+        for model in self.models:
+            preds = model.predict({'ts_input': ts_data, 'static_input': static_data}, verbose=0)
+            ensemble_preds.append(preds)
+            
+        avg_preds = np.mean(ensemble_preds, axis=0)
+        predicted_class = np.argmax(avg_preds, axis=1)[0]
+        
+        return self.label_encoder.inverse_transform([predicted_class])[0]
+
+# =========================================================================
+# 訓練函式 (僅在離線模式下執行一次)
+# =========================================================================
+def train_and_save_models():
+    """
+    執行完整的交叉驗證訓練流程並儲存模型和轉換器。
+    這部分程式碼只會在離線模式下執行。
+    """
+    print("正在執行訓練和模型保存...")
+    train_sequences, y_gesture, subjects, _, label_encoder, non_target_gestures, static_data = load_and_preprocess_data_for_training(TRAIN_CSV_PATH, TRAIN_DEMO_PATH)
+    
     num_gesture_classes = len(label_encoder.classes_)
-    print(f"偵測到 {num_gesture_classes} 個手勢類別。")
     sequence_lengths = [len(s) for s in train_sequences]
     max_seq_len = int(np.percentile(sequence_lengths, PAD_PERCENTILE))
-    print(f"最大序列長度: {max_seq_len}")
-    tof_features_count = len(tof_features)
     
-    # === 修正後的訓練資料前處理 ===
     all_padded_ts = pad_sequences(train_sequences, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post')
     imu_and_manual_features = len(sensor_features) + len(manual_features) + len(angular_features) + 2 + 2 
     padded_imu_features = all_padded_ts[:, :, :imu_and_manual_features]
     padded_tof_features = all_padded_ts[:, :, imu_and_manual_features:]
     
-    tof_data_flat_train = padded_tof_features.reshape(-1, tof_features_count)
-    
-    # 在 PCA 擬合之前，先過濾掉全為零的行
+    tof_data_flat_train = padded_tof_features.reshape(-1, len(tof_features))
     valid_tof_rows = tof_data_flat_train[tof_data_flat_train.sum(axis=1) != 0]
     pca = PCA(n_components=N_COMPONENTS, random_state=42)
     pca.fit(valid_tof_rows)
@@ -456,58 +460,85 @@ def train_and_predict_models():
     final_ts_features_scaled = ts_scaler.transform(final_ts_features.reshape(-1, final_ts_features.shape[2])).reshape(final_ts_features.shape)
     static_data_scaled = static_scaler.transform(static_data)
     
-    print("正在計算類別權重...")
     class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(y_gesture), y=y_gesture)
     class_weights_dict = dict(enumerate(class_weights))
-    print("計算出的類別權重：", class_weights_dict)
-
-    print("\n開始交叉驗證訓練...")
+    
     n_sp = 5
     gkf = GroupKFold(n_splits=n_sp)
     ensemble_model_paths = []
     all_histories = []
+
+    # ------------------ Mixup 輔助函式 ------------------
+    def train_generator(X_ts, X_static, y, batch_size, mixup_alpha):
+        num_samples = len(X_ts)
+        while True:
+            # 隨機打亂索引
+            indices = np.arange(num_samples)
+            np.random.shuffle(indices)
+            
+            # 確保批次大小為偶數
+            for start in range(0, num_samples, batch_size):
+                end = start + batch_size
+                batch_indices = indices[start:end]
+                
+                # 如果批次大小為奇數，則跳過最後一個樣本
+                if len(batch_indices) % 2 != 0:
+                    continue
+                
+                # 混合索引
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                
+                # 取得第一組樣本
+                x_ts_1 = X_ts[batch_indices[:batch_size//2]]
+                x_static_1 = X_static[batch_indices[:batch_size//2]]
+                y_1 = y[batch_indices[:batch_size//2]]
+                
+                # 取得第二組樣本 (打亂順序)
+                x_ts_2 = X_ts[batch_indices[batch_size//2:]]
+                x_static_2 = X_static[batch_indices[batch_size//2:]]
+                y_2 = y[batch_indices[batch_size//2:]]
+
+                # 混合特徵和標籤
+                x_ts_mixed = lam * x_ts_1 + (1 - lam) * x_ts_2
+                x_static_mixed = lam * x_static_1 + (1 - lam) * x_static_2
+                y_mixed = lam * y_1 + (1 - lam) * y_2
+                
+                yield {'ts_input': x_ts_mixed, 'static_input': x_static_mixed}, y_mixed
+    # ----------------------------------------------------
 
     for fold, (train_index, val_index) in enumerate(gkf.split(final_ts_features_scaled, y_gesture, groups=subjects)):
         print(f"\n- 折疊 (Fold) {fold+1}/{n_sp}")
         X_train_ts, X_val_ts = final_ts_features_scaled[train_index], final_ts_features_scaled[val_index]
         X_train_static, X_val_static = static_data_scaled[train_index], static_data_scaled[val_index]
         y_train, y_val = y_gesture[train_index], y_gesture[val_index]
+        
         y_train_one_hot = to_categorical(y_train, num_classes=num_gesture_classes)
         y_val_one_hot = to_categorical(y_val, num_classes=num_gesture_classes)
+
         K.clear_session()
         set_seeds()
         
         model = build_two_branch_model(X_train_ts.shape[1:], X_train_static.shape[1:], num_gesture_classes, wd=WD)
         temp_checkpoint_filepath = os.path.join(WORKING_DIR, f'best_model_fold_{fold+1}.h5')
-        model_checkpoint_callback = ModelCheckpoint(
-            filepath=temp_checkpoint_filepath, 
-            monitor='val_loss', 
-            mode='min', 
-            save_best_only=True, 
-            verbose=0
-        )
-        early_stopping_callback = EarlyStopping(
-            monitor='val_loss', 
-            patience=PATIENCE,
-            restore_best_weights=True
-        )
+        model_checkpoint_callback = ModelCheckpoint(filepath=temp_checkpoint_filepath, monitor='val_loss', mode='min', save_best_only=True, verbose=0)
+        early_stopping_callback = EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True)
+        
+        # 實例化訓練生成器
+        train_gen = train_generator(X_train_ts, X_train_static, y_train_one_hot, BATCH_SIZE, MIXUP_ALPHA)
+        
         history = model.fit(
-            {'ts_input': X_train_ts, 'static_input': X_train_static},
-            y_train_one_hot, 
+            train_gen,
             epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            validation_data=({'ts_input': X_val_ts, 'static_input': X_val_static}, y_val_one_hot), 
+            steps_per_epoch=len(X_train_ts) // BATCH_SIZE,
+            validation_data=({'ts_input': X_val_ts, 'static_input': X_val_static}, y_val_one_hot),
             verbose=1,
-            callbacks=[model_checkpoint_callback, early_stopping_callback],
-            class_weight=class_weights_dict
+            callbacks=[model_checkpoint_callback, early_stopping_callback]
         )
         all_histories.append(history)
         model.load_weights(temp_checkpoint_filepath)
         predictions = model.predict({'ts_input': X_val_ts, 'static_input': X_val_static})
         predicted_classes = np.argmax(predictions, axis=1)
-        binary_f1, macro_f1, final_score = evaluate_metrics(
-            y_val, predicted_classes, label_encoder, non_target_gestures
-        )
+        binary_f1, macro_f1, final_score = evaluate_metrics(y_val, predicted_classes, label_encoder, non_target_gestures)
         print(f"模型在折疊 {fold+1} 的驗證得分: Binary F1: {binary_f1:.4f}, Macro F1: {macro_f1:.4f}, Final Score: {final_score:.4f}")
         if not np.isnan(final_score):
             ensemble_model_paths.append(('two_branch', temp_checkpoint_filepath))
@@ -516,35 +547,17 @@ def train_and_predict_models():
     plot_training_history(all_histories)
     print(f"\n最佳模型已儲存至: {ensemble_model_paths}")
     
-    # 載入並前處理測試資料
-    test_sequences, _, _, test_sequence_ids, _, _, test_static_data = load_and_preprocess_data(TEST_CSV_PATH, TEST_DEMO_PATH, is_training=False)
-    test_sequences_padded = pad_sequences(test_sequences, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post')
-    imu_and_manual_features_test = len(sensor_features) + len(manual_features) + len(angular_features) + 2 + 2
-    test_imu_features = test_sequences_padded[:, :, :imu_and_manual_features_test]
-    test_tof_features = test_sequences_padded[:, :, imu_and_manual_features_test:]
-    
-    # === 關鍵修復 ===
-    test_tof_pca = pca.transform(test_tof_features.reshape(-1, len(tof_features))).reshape(test_tof_features.shape[0], test_tof_features.shape[1], N_COMPONENTS)
-    # === 關鍵修復 ===
+    # 在這裡將所有轉換器保存到磁碟
+    joblib.dump(pca, os.path.join(WORKING_DIR, 'pca.pkl'))
+    joblib.dump(ts_scaler, os.path.join(WORKING_DIR, 'ts_scaler.pkl'))
+    joblib.dump(static_scaler, os.path.join(WORKING_DIR, 'static_scaler.pkl'))
+    joblib.dump(label_encoder, os.path.join(WORKING_DIR, 'label_encoder.pkl'))
+    joblib.dump(max_seq_len, os.path.join(WORKING_DIR, 'max_seq_len.pkl'))
 
-    test_final_ts_features = np.concatenate([test_imu_features, test_tof_pca], axis=-1)
-    test_final_ts_features_scaled = ts_scaler.transform(test_final_ts_features.reshape(-1, test_final_ts_features.shape[2])).reshape(test_final_ts_features.shape)
-    test_static_data_scaled = static_scaler.transform(test_static_data)
-    
-    predict_and_generate_submission_ensemble(
-        model_paths=ensemble_model_paths,
-        test_ts_data=test_final_ts_features_scaled,
-        test_static_data=test_static_data_scaled,
-        test_sequence_ids=test_sequence_ids,
-        label_encoder=label_encoder
-    )
 
-def predict_and_generate_submission_ensemble(
-    model_paths, test_ts_data, test_static_data, test_sequence_ids, label_encoder
-):
+def predict_and_generate_submission_ensemble_offline(model_paths, test_ts_data, test_static_data, test_sequence_ids, label_encoder):
     print("\n--- 正在進行集成學習預測 ---")
     ensemble_predictions = []
-    
     for i, model_info in enumerate(model_paths):
         model_name, model_path = model_info
         try:
@@ -560,22 +573,93 @@ def predict_and_generate_submission_ensemble(
         except Exception as e:
             print(f"無法載入模型 {model_path}：{e}")
             continue
-
     if not ensemble_predictions:
         print("沒有可用的模型進行預測。")
         return
-
     averaged_predictions = np.mean(ensemble_predictions, axis=0)
     predicted_classes = np.argmax(averaged_predictions, axis=1)
     predicted_gestures = label_encoder.inverse_transform(predicted_classes)
-    submission_df = pd.DataFrame({
-        'sequence_id': test_sequence_ids,
-        'gesture': predicted_gestures
-    })
+    submission_df = pd.DataFrame({'sequence_id': test_sequence_ids, 'gesture': predicted_gestures})
     submission_file_path = os.path.join(WORKING_DIR, 'submission.parquet')
     submission_df.to_parquet(submission_file_path, index=False)
     print(f"\n--- 提交檔案 '{submission_file_path}' 成功生成！ ---")
     print(submission_df.head())
 
+
+# =========================================================================
+# 主入口點
+# =========================================================================
 if __name__ == '__main__':
-    train_and_predict_models()
+    # 判斷是否為線上評估模式 (cmi_api 存在)
+    if cmi_api is None:
+        # 離線模式：執行訓練並生成 submission.parquet
+        train_and_save_models()
+        
+        # 加載訓練後保存的轉換器
+        pca = joblib.load(os.path.join(WORKING_DIR, 'pca.pkl'))
+        ts_scaler = joblib.load(os.path.join(WORKING_DIR, 'ts_scaler.pkl'))
+        static_scaler = joblib.load(os.path.join(WORKING_DIR, 'static_scaler.pkl'))
+        label_encoder = joblib.load(os.path.join(WORKING_DIR, 'label_encoder.pkl'))
+        max_seq_len = joblib.load(os.path.join(WORKING_DIR, 'max_seq_len.pkl'))
+        
+        # 這裡需要找到你的模型路徑
+        model_paths = []
+        for i in range(5):
+            path = os.path.join(WORKING_DIR, f'best_model_fold_{i+1}.h5')
+            if os.path.exists(path):
+                model_paths.append(('two_branch', path))
+        
+        print("在離線模式下進行預測並生成提交文件。")
+        test_sequences, _, _, test_sequence_ids, _, _, test_static_data = load_and_preprocess_data_for_training(TEST_CSV_PATH, TEST_DEMO_PATH, is_training=False)
+        
+        test_sequences_padded = pad_sequences(test_sequences, maxlen=max_seq_len, dtype='float32', padding='post', truncating='post')
+        imu_and_manual_features_test = len(sensor_features) + len(manual_features) + len(angular_features) + 2 + 2
+        test_imu_features = test_sequences_padded[:, :, :imu_and_manual_features_test]
+        test_tof_features = test_sequences_padded[:, :, imu_and_manual_features_test:]
+        test_tof_pca = pca.transform(test_tof_features.reshape(-1, len(tof_features))).reshape(test_tof_features.shape[0], test_tof_features.shape[1], N_COMPONENTS)
+        test_final_ts_features = np.concatenate([test_imu_features, test_tof_pca], axis=-1)
+        test_final_ts_features_scaled = ts_scaler.transform(test_final_ts_features.reshape(-1, test_final_ts_features.shape[2])).reshape(test_final_ts_features.shape)
+        test_static_data_scaled = static_scaler.transform(test_static_data)
+
+        predict_and_generate_submission_ensemble_offline(
+            model_paths=model_paths,
+            test_ts_data=test_final_ts_features_scaled,
+            test_static_data=test_static_data_scaled,
+            test_sequence_ids=test_sequence_ids,
+            label_encoder=label_encoder
+        )
+
+    else:
+        # 線上模式：載入模型和轉換器，並啟動 API
+        print("正在啟動 Kaggle 評估伺服器...")
+        
+        # 載入所有訓練時保存的轉換器
+        # 這些檔案必須是你提交的 dataset 之一
+        pca = joblib.load(os.path.join('/kaggle/input/cmi-models-v2/pca.pkl'))
+        ts_scaler = joblib.load(os.path.join('/kaggle/input/cmi-models-v2/ts_scaler.pkl'))
+        static_scaler = joblib.load(os.path.join('/kaggle/input/cmi-models-v2/static_scaler.pkl'))
+        label_encoder = joblib.load(os.path.join('/kaggle/input/cmi-models-v2/label_encoder.pkl'))
+        max_seq_len = joblib.load(os.path.join('/kaggle/input/cmi-models-v2/max_seq_len.pkl'))
+        
+        # 這裡的H5模型檔案必須是你提交的 dataset 之一
+        model_paths = [
+            ('model_1', '/kaggle/input/cmi-models-v2/best_model_fold_1.h5'),
+            ('model_2', '/kaggle/input/cmi-models-v2/best_model_fold_2.h5'),
+            ('model_3', '/kaggle/input/cmi-models-v2/best_model_fold_3.h5'),
+            ('model_4', '/kaggle/input/cmi-models-v2/best_model_fold_4.h5'),
+            ('model_5', '/kaggle/input/cmi-models-v2/best_model_fold_5.h5'),
+        ]
+        
+        # 實例化預測器
+        predictor = GesturePredictor(model_paths, max_seq_len, ts_scaler, static_scaler, pca, label_encoder)
+        
+        # 定義 Kaggle API 類別並啟動伺服器
+        class API(cmi_api.Base):
+            def __init__(self):
+                super().__init__()
+                self.predictor = predictor
+            
+            def get_prediction(self, test_df):
+                return self.predictor.predict(test_df)
+        
+        cmi_api.run(API)
